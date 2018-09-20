@@ -16,6 +16,6 @@ let package = Package(
     targets: [
         .target(
             name: "HttpClient",
-            dependencies: ["NIO", "NIOHTTP1", "NIOOpenSSL"]),
+            dependencies: ["NIO", "NIOHTTP1", "NIOOpenSSL", "NIOConcurrencyHelpers"]),
     ]
 )

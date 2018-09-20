@@ -1,6 +1,7 @@
 import NIO
 import NIOHTTP1
 import NIOOpenSSL
+import NIOConcurrencyHelpers
 
 
 class HttpHandler: ChannelInboundHandler {
@@ -8,9 +9,11 @@ class HttpHandler: ChannelInboundHandler {
     typealias InboundIn = HTTPClientResponsePart
 
     let promise: EventLoopPromise<Void>
+    var closed: Bool
 
     init(_ promise: EventLoopPromise<Void>) {
         self.promise = promise
+        closed = false
     }
 
     func channelRead(ctx: ChannelHandlerContext, data: NIOAny) {
@@ -27,15 +30,33 @@ class HttpHandler: ChannelInboundHandler {
                 print(body)
             }
         case .end(_):
-            promise.succeed(result: ())
-            _ = ctx.channel.close()
+            closeIfNotClosed(ctx: ctx) {
+                $0.succeed(result: ())
+            }
+        }
+    }
+
+    private func closeIfNotClosed(ctx: ChannelHandlerContext, _ withPromise: (EventLoopPromise<Void>) -> ()) {
+        let c = UnsafeMutableRawPointer(&closed)
+        let ptr: OpaquePointer = OpaquePointer(c)
+        if !Bool.atomic_load(ptr) {
+            withPromise(promise)
+            ctx.channel.close(promise: nil)
+            _ = Bool.atomic_compare_and_exchange(ptr, false, true)
+        }
+    }
+
+    func channelInactive(ctx: ChannelHandlerContext) {
+        closeIfNotClosed(ctx: ctx) {
+            $0.fail(error: ChannelError.alreadyClosed)
         }
     }
 
     func errorCaught(ctx: ChannelHandlerContext, error: Error) {
         print("Error: \(error)")
-        promise.fail(error: error)
-        _ = ctx.channel.close()
+        closeIfNotClosed(ctx: ctx) {
+            $0.fail(error: error)
+        }
     }
 }
 
@@ -148,25 +169,22 @@ let bootstrap = ClientBootstrap(group: eventLoopGroup)
             }
         }
 
-let future = bootstrap.connect(host: url.host, port: url.portNumber).then { (channel: Channel) -> EventLoopFuture<Void> in
+bootstrap.connect(host: url.host, port: url.portNumber).then { (channel: Channel) -> EventLoopFuture<Void> in
     var request = HTTPRequestHead(version: HTTPVersion(major: 1, minor: 1), method: HTTPMethod.GET, uri: url.uri)
     request.headers = HTTPHeaders([
         ("Host", url.host),
         ("User-Agent", "swift-nio"),
         ("Accept-Encoding", "identity"),
         ("Accept", "application/json"),
+//        ("Connection", "close"),
     ])
-    _ = channel.write(HTTPClientRequestPart.head(request))
+    channel.write(HTTPClientRequestPart.head(request), promise: nil)
     return channel.writeAndFlush(HTTPClientRequestPart.end(nil))
-}
-
-try! future.wait()
+}.cascadeFailure(promise: promise)
 
 defer {
-    do {
-        try promise.futureResult.wait()
-    } catch {
-        print("Error on sync: \(error)")
-    }
     try! eventLoopGroup.syncShutdownGracefully()
+}
+defer {
+    try! promise.futureResult.wait()
 }
